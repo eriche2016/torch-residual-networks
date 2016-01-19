@@ -1,3 +1,23 @@
+--[[
+Copyright (c) 2016 Michael Wilber
+
+This software is provided 'as-is', without any express or implied
+warranty. In no event will the authors be held liable for any damages
+arising from the use of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not
+   claim that you wrote the original software. If you use this software
+   in a product, an acknowledgement in the product documentation would be
+   appreciated but is not required.
+2. Altered source versions must be plainly marked as such, and must not be
+   misrepresented as being the original software.
+3. This notice may not be removed or altered from any source distribution.
+--]]
+
 require 'residual-layers'
 require 'nn'
 require 'cutorch'
@@ -8,7 +28,8 @@ require 'train-helpers'
 display = require 'display'
 
 opt = lapp[[
-      --batchSize       (default 48)     Batch size
+      --batchSize       (default 24)      Sub-batch size
+      --iterSize        (default 8)       How many sub-batches in each batch
       --nThreads        (default 4)       Data loader threads
       --dataTrainRoot   (default /mnt/imagenet/train)   Data root folder
       --dataValRoot     (default /mnt/imagenet/val)   Data root folder
@@ -19,7 +40,7 @@ opt = lapp[[
 print(opt)
 
 -- create data loader
-local DataLoader = paths.dofile('data.lua')
+local DataLoader = paths.dofile('data/data.lua')
 dataTrain = DataLoader.new(opt.nThreads, 'folder', {dataRoot = opt.dataTrainRoot,
                                                     fineSize = opt.fineSize,
                                                     loadSize = opt.loadSize,
@@ -59,29 +80,35 @@ print("Dataset size: ", dataTrain:size())
 -- Residual network.
 -- Input: 3x224x224
 input = nn.Identity()()
-model = cudnn.SpatialConvolution(3, 64, 7,7, 2,2, 3,3)(input)
 ------> 64, 112,112
+model = cudnn.SpatialConvolution(3, 64, 7,7, 2,2, 3,3)(input)
+--model = nn.SpatialBatchNormalization(64)(model)
 model = cudnn.ReLU(true)(model)
 model = cudnn.SpatialMaxPooling(3,3,  2,2,  1,1)(model)
 ------> 64, 56,56
 model = addResidualLayer2(model, 64)
---model = addResidualLayer2(model, 64)
-model = addResidualLayer2(model, 64, 128, 2)
+model = addResidualLayer2(model, 64)
+model = addResidualLayer2(model, 64)
 ------> 128, 28,28
+model = addResidualLayer2(model, 64, 128, 2)
 model = addResidualLayer2(model, 128)
---model = addResidualLayer2(model, 128)
-model = addResidualLayer2(model, 128, 256, 2)
+model = addResidualLayer2(model, 128)
+model = addResidualLayer2(model, 128)
 ------> 256, 14,14
+model = addResidualLayer2(model, 128, 256, 2)
 model = addResidualLayer2(model, 256)
---model = addResidualLayer2(model, 256)
-model = addResidualLayer2(model, 256, 512, 2)
+model = addResidualLayer2(model, 256)
+model = addResidualLayer2(model, 256)
+model = addResidualLayer2(model, 256)
+model = addResidualLayer2(model, 256)
 ------> 512, 7,7
+model = addResidualLayer2(model, 256, 512, 2)
 model = addResidualLayer2(model, 512)
---model = addResidualLayer2(model, 512)
-model = cudnn.ReLU(true)(cudnn.SpatialConvolution(512, 1000, 7,7)(model))
+model = addResidualLayer2(model, 512)
 ------> 1000, 1,1
-model = nn.Reshape(1000)(model)
+model = cudnn.ReLU(true)(cudnn.SpatialConvolution(512, 1000, 7,7)(model))
 ------> 1000
+model = nn.Reshape(1000)(model)
 model = nn.LogSoftMax()(model)
 
 model = nn.gModule({input}, {model})
@@ -125,13 +152,16 @@ print(mem_usage)
 sgdState = {
    --- For SGD with momentum ---
    -- --[[
-   --learningRate = 0.01,
+   -- My semi-working settings
    learningRate = 0.001,
+   weightDecay    = 1e-4,
+   -- Settings from their paper
+   --learningRate = 0.1,
+   --weightDecay    = 1e-4,
+
    momentum     = 0.9,
    dampening    = 0,
-   weightDecay    = 1e-6,
    nesterov     = true,
-   epochDropCount = 20,
    --]]
    --- For rmsprop, which is very fiddly and I don't trust it at all ---
    --[[
@@ -168,19 +198,35 @@ weights, gradients = model:getParameters()
 function forwardBackwardBatch(batch)
    model:training()
    gradients:zero()
-   local inputs, labels = dataTrain:getBatch()
-   local inputs = inputs:cuda()
-   local labels = labels:cuda()
-   local y = model:forward(inputs)
-   local loss_val = loss:forward(y, labels)
-   local df_dw = loss:backward(y, labels)
-   model:backward(inputs, df_dw)
+
+   --[[
+   if sgdState.nSampledImages < 10000 then
+       sgdState.learningRate = 0.001
+   else
+       sgdState.learningRate = 0.01
+   end
+   --]]
+
+   local loss_val = 0
+   local N = opt.iterSize
+   local inputs, labels
+   for i=1,N do
+       inputs, labels = dataTrain:getBatch()
+       local inputs = inputs:cuda()
+       local labels = labels:cuda()
+       local y = model:forward(inputs)
+       loss_val = loss_val + loss:forward(y, labels)
+       local df_dw = loss:backward(y, labels)
+       model:backward(inputs, df_dw)
+   end
+   loss_val = loss_val / N
+   gradients:mul( 1.0 / N )
 
    if sgdState.nEvalCounter % 20 == 0 then
       display.image(model.modules[2].weight, {win=24, title="First layer weights"})
    end
 
-   return loss_val, gradients, inputs:size(1)
+   return loss_val, gradients, inputs:size(1) * N
 end
 
 
@@ -189,7 +235,7 @@ function evalModel()
    -- if sgdState.epochCounter > 10 then os.exit(1) end
    local results = evaluateModel(model, dataVal)
    print(results)
-   table.insert(sgdState.accuracies, acc)
+   --table.insert(sgdState.accuracies, acc)
 end
 
 --[[
@@ -202,6 +248,14 @@ require 'graph'
 graph.dot(model.fg, 'MLP', '/tmp/MLP')
 os.execute('convert /tmp/MLP.svg /tmp/MLP.png')
 display.image(image.load('/tmp/MLP.png'), {title="Network Structure", win=23})
+--]]
+
+-- --[[
+require 'ncdu-model-explore'
+local y = model:forward(torch.randn(opt.batchSize, 3, 224,224):cuda())
+local df_dw = loss:backward(y, torch.zeros(opt.batchSize):cuda())
+model:backward(torch.randn(opt.batchSize,3,224,224):cuda(), df_dw)
+exploreNcdu(model)
 --]]
 
 
